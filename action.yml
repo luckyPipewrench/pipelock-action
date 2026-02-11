@@ -1,0 +1,271 @@
+name: 'Pipelock Security Scanner'
+description: 'Scan for secrets, audit projects, and verify workspace integrity with Pipelock.'
+author: 'luckyPipewrench'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  mode:
+    description: 'Scan mode: audit, git-scan-diff, integrity-check'
+    required: true
+  version:
+    description: 'Pipelock version to use (default: latest)'
+    required: false
+    default: 'latest'
+  config:
+    description: 'Path to pipelock.yaml config file'
+    required: false
+    default: ''
+  directory:
+    description: 'Directory to scan (audit and integrity-check modes)'
+    required: false
+    default: '.'
+  manifest:
+    description: 'Path to integrity manifest (integrity-check mode)'
+    required: false
+    default: ''
+  fail-on-findings:
+    description: 'Fail the workflow if findings are detected'
+    required: false
+    default: 'true'
+
+outputs:
+  findings:
+    description: 'JSON output from the scan'
+    value: ${{ steps.scan.outputs.findings }}
+  exit-code:
+    description: 'Pipelock exit code (0 = clean, 1 = findings detected)'
+    value: ${{ steps.scan.outputs.exit_code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Pipelock
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        VERSION="$INPUT_VERSION"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -fsSL https://api.github.com/repos/luckyPipewrench/pipelock/releases/latest | jq -r '.tag_name // empty') || {
+            echo "::error::Failed to fetch latest Pipelock version. You may be rate-limited. Pin a version with 'version: v0.1.5'."
+            exit 1
+          }
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine latest Pipelock version. No releases found or API response was empty."
+            exit 1
+          fi
+        fi
+
+        # Strip leading v for asset name
+        ASSET_VERSION="${VERSION#v}"
+
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        ARCH="$(uname -m)"
+        if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
+        if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi
+
+        ASSET="pipelock_${ASSET_VERSION}_${OS}_${ARCH}.tar.gz"
+        CHECKSUMS_URL="https://github.com/luckyPipewrench/pipelock/releases/download/${VERSION}/checksums.txt"
+        URL="https://github.com/luckyPipewrench/pipelock/releases/download/${VERSION}/${ASSET}"
+
+        echo "::group::Installing Pipelock ${VERSION}"
+
+        curl -fsSL "$URL" -o pipelock.tar.gz || {
+          echo "::error::Failed to download Pipelock from ${URL}. Check that version '${VERSION}' exists."
+          exit 1
+        }
+
+        # Verify checksum
+        curl -fsSL "$CHECKSUMS_URL" -o checksums.txt || {
+          echo "::warning::Could not download checksums.txt. Skipping checksum verification."
+        }
+        if [ -f checksums.txt ]; then
+          EXPECTED=$(grep "$ASSET" checksums.txt | awk '{print $1}')
+          ACTUAL=$(sha256sum pipelock.tar.gz | awk '{print $1}')
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Checksum mismatch! Expected ${EXPECTED}, got ${ACTUAL}."
+            exit 1
+          fi
+        fi
+
+        tar xzf pipelock.tar.gz pipelock
+        chmod +x pipelock
+
+        INSTALL_DIR="${RUNNER_TOOL_CACHE:-/usr/local/bin}"
+        mv pipelock "${INSTALL_DIR}/pipelock" || {
+          # Fallback: install next to the tarball and add to PATH
+          INSTALL_DIR="$(pwd)"
+          echo "::warning::Could not install to ${RUNNER_TOOL_CACHE:-/usr/local/bin}. Using ${INSTALL_DIR}."
+        }
+        echo "${INSTALL_DIR}" >> "$GITHUB_PATH"
+        rm -f pipelock.tar.gz checksums.txt
+
+        echo "Installed pipelock ${VERSION}"
+        pipelock version
+        echo "::endgroup::"
+
+    - name: Run Pipelock scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_DIR: ${{ inputs.directory }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_MANIFEST: ${{ inputs.manifest }}
+        INPUT_FAIL: ${{ inputs.fail-on-findings }}
+      run: |
+        set -uo pipefail
+
+        MODE="$INPUT_MODE"
+        DIR="$INPUT_DIR"
+        CONFIG="$INPUT_CONFIG"
+        MANIFEST="$INPUT_MANIFEST"
+        FAIL_ON_FINDINGS="$INPUT_FAIL"
+
+        # Build config flag as array to handle spaces in paths
+        PIPELOCK_ARGS=()
+        if [ -n "$CONFIG" ]; then
+          PIPELOCK_ARGS+=(--config "$CONFIG")
+        fi
+
+        EXIT_CODE=0
+        FINDINGS=""
+        FINDINGS_FILE="$(mktemp)"
+        trap 'rm -f "$FINDINGS_FILE"' EXIT
+
+        # Random delimiter to prevent output injection
+        DELIMITER="PIPELOCK_EOF_$(head -c 16 /dev/urandom | base64 | tr -d '/+=')"
+
+        write_findings_output() {
+          echo "findings<<${DELIMITER}" >> "$GITHUB_OUTPUT"
+          cat "$FINDINGS_FILE" >> "$GITHUB_OUTPUT"
+          echo "${DELIMITER}" >> "$GITHUB_OUTPUT"
+        }
+
+        case "$MODE" in
+          audit)
+            pipelock audit --json "$DIR" > "$FINDINGS_FILE" 2>&1 || EXIT_CODE=$?
+            FINDINGS=$(cat "$FINDINGS_FILE")
+            write_findings_output
+
+            # Validate JSON before parsing
+            if ! jq empty "$FINDINGS_FILE" 2>/dev/null; then
+              echo "::error::Pipelock did not produce valid JSON. Raw output:"
+              cat "$FINDINGS_FILE"
+              echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            # Job summary
+            SCORE=$(jq -r '.score // 0' "$FINDINGS_FILE")
+            SCORE_WITH=$(jq -r '.score_with_config // 0' "$FINDINGS_FILE")
+            AGENT=$(jq -r '.agent_type // "unknown"' "$FINDINGS_FILE")
+            CRITICALS=$(jq '[.findings[]? | select(.severity == "critical")] | length' "$FINDINGS_FILE")
+            WARNINGS=$(jq '[.findings[]? | select(.severity == "warning")] | length' "$FINDINGS_FILE")
+            INFOS=$(jq '[.findings[]? | select(.severity == "info")] | length' "$FINDINGS_FILE")
+
+            {
+              echo "## Pipelock Audit Results"
+              echo ""
+              echo "| Metric | Value |"
+              echo "|--------|-------|"
+              echo "| Agent Type | $AGENT |"
+              echo "| Score (unprotected) | $SCORE/100 |"
+              echo "| Score (with config) | $SCORE_WITH/100 |"
+              echo "| Critical | $CRITICALS |"
+              echo "| Warning | $WARNINGS |"
+              echo "| Info | $INFOS |"
+              echo ""
+              if [ "$CRITICALS" -gt 0 ]; then
+                echo "### Critical Findings"
+                echo ""
+                jq -r '.findings[]? | select(.severity == "critical") | "- **\(.message)**\(if .file != "" then " (\(.file))" else "" end)"' "$FINDINGS_FILE"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            ;;
+
+          git-scan-diff)
+            # Handle first commit (no parent) and shallow clones
+            if git rev-parse HEAD~1 >/dev/null 2>&1; then
+              DIFF_BASE="HEAD~1"
+            else
+              echo "::warning::No parent commit found (first commit or shallow clone). Scanning all files against empty tree."
+              DIFF_BASE=$(git hash-object -t tree /dev/null)
+            fi
+
+            git diff "$DIFF_BASE" | pipelock git scan-diff --json "${PIPELOCK_ARGS[@]+"${PIPELOCK_ARGS[@]}"}" > "$FINDINGS_FILE" 2>&1 || EXIT_CODE=$?
+            FINDINGS=$(cat "$FINDINGS_FILE")
+            write_findings_output
+
+            if ! jq empty "$FINDINGS_FILE" 2>/dev/null; then
+              echo "::error::Pipelock did not produce valid JSON. Raw output:"
+              cat "$FINDINGS_FILE"
+              echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            COUNT=$(jq 'length' "$FINDINGS_FILE")
+
+            {
+              echo "## Pipelock Diff Scan Results"
+              echo ""
+              if [ "$COUNT" -eq 0 ]; then
+                echo "No secrets found in diff."
+              else
+                echo "**Found $COUNT secret(s) in diff.**"
+                echo ""
+                echo "| File | Line | Pattern | Severity |"
+                echo "|------|------|---------|----------|"
+                jq -r '.[] | "| \(.file) | \(.line) | \(.pattern) | \(.severity) |"' "$FINDINGS_FILE"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            ;;
+
+          integrity-check)
+            MANIFEST_ARGS=()
+            if [ -n "$MANIFEST" ]; then
+              MANIFEST_ARGS+=(--manifest "$MANIFEST")
+            fi
+
+            pipelock integrity check --json "$DIR" "${MANIFEST_ARGS[@]+"${MANIFEST_ARGS[@]}"}" > "$FINDINGS_FILE" 2>&1 || EXIT_CODE=$?
+            FINDINGS=$(cat "$FINDINGS_FILE")
+            write_findings_output
+
+            {
+              echo "## Pipelock Integrity Check Results"
+              echo ""
+              if [ "$EXIT_CODE" -eq 0 ]; then
+                echo "All files match the integrity manifest."
+              else
+                echo "**Integrity violations detected.**"
+                echo ""
+                echo '```'
+                cat "$FINDINGS_FILE"
+                echo '```'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            ;;
+
+          *)
+            echo "::error::Unknown mode: $MODE. Must be one of: audit, git-scan-diff, integrity-check"
+            exit 1
+            ;;
+        esac
+
+        echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        # Distinguish findings (exit 1) from crashes (exit > 1)
+        if [ "$EXIT_CODE" -gt 1 ]; then
+          echo "::error::Pipelock failed with exit code $EXIT_CODE. This indicates a configuration error or bug, not scan findings."
+          exit "$EXIT_CODE"
+        fi
+
+        if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$EXIT_CODE" -eq 1 ]; then
+          echo "::error::Pipelock found security issues. Set fail-on-findings to 'false' to continue despite findings."
+          exit 1
+        fi

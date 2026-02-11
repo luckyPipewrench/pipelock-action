@@ -1,0 +1,43 @@
+name: Pipelock Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: luckyPipewrench/pipelock-action@v1
+        with:
+          mode: audit
+          directory: '.'
+
+  scan-diff:
+    name: Diff Secret Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Required for diff scanning
+
+      - uses: luckyPipewrench/pipelock-action@v1
+        with:
+          mode: git-scan-diff
+
+  integrity:
+    name: Workspace Integrity
+    runs-on: ubuntu-latest
+    if: hashFiles('.integrity-manifest.json') != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: luckyPipewrench/pipelock-action@v1
+        with:
+          mode: integrity-check
+          manifest: '.integrity-manifest.json'
